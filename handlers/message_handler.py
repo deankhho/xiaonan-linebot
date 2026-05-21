@@ -1,16 +1,15 @@
-# handlers/message_handler.py — LINE 訊息事件 Orchestrator
+# handlers/message_handler.py — LINE Webhook Orchestrator（Cloud-native）
 #
-# 職責：只負責協調各 service，不含業務邏輯。
-# 流程（每個 handler）：
-#   1. [image] 下載媒體 → save_to_temp
-#   2. backup（失敗 → deadletter，繼續）
-#   3. enqueue
-#   4. 立即回覆使用者
-#   5. trigger_worker（singleton，已在跑則 skip）
+# 設計原則：
+#   - reply 先行（最快，不依賴任何 IO），reply 失敗只 log 不中斷
+#   - background thread 處理所有 IO（Drive + Sheets）
+#   - worker_lock 串行化 background 工作（防 API throttling）
+#   - dedup atomic（is_duplicate_and_mark）防 LINE retry 重複寫入
 #
-# Phase 1：只處理 text / image，video 不支援
+# Phase 1：text + image（video 不支援）
 
 import os
+import threading
 import logging
 from linebot.v3.messaging import (
     ApiClient, Configuration, MessagingApi,
@@ -18,59 +17,77 @@ from linebot.v3.messaging import (
 )
 
 from storage.event_schema import LifeEvent, make_timestamp
-from services import backup_service, queue_service, async_worker
-from services import drive_service
+from services import sheets_service, drive_service
 
-_log    = logging.getLogger(__name__)
-_config = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
+_log         = logging.getLogger(__name__)
+_config      = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
+_worker_lock = threading.Lock()   # 串行化 background IO，防 burst throttling
 
 
-def _reply(reply_token: str, text: str) -> None:
-    """回覆純文字訊息"""
-    with ApiClient(_config) as api_client:
-        MessagingApi(api_client).reply_message(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=[TextMessage(text=text)],
-            )
-        )
-
+# ── 主要 handler ─────────────────────────────────────────────
 
 def handle_text(event) -> None:
-    """
-    文字訊息流程：
-      build event → backup → enqueue → reply → trigger_worker
-    """
-    user_id = event.source.user_id
-    content = event.message.text
-    _log.info("text from %s", user_id)
+    ts       = make_timestamp()
+    user_id  = event.source.user_id
+    event_id = f"{ts}_{user_id[-6:]}"
 
-    ev = LifeEvent.from_text(user_id=user_id, content=content)
-    backup_service.write_backup(ev)    # 失敗 → deadletter，繼續
-    queue_service.enqueue(ev)
+    if sheets_service.is_duplicate_and_mark(event_id):
+        _log.info("dedup skip text: %s", event_id)
+        return
 
-    _reply(event.reply_token, "✅ 已記錄")
-    async_worker.trigger_worker()
+    ev = LifeEvent.from_text(user_id, event.message.text, ts)
+
+    try:
+        _reply(event.reply_token, "✅ 已記錄")
+    except Exception as e:
+        _log.error("reply failed: %s", e)
+
+    threading.Thread(target=_process_text, args=(ev,), daemon=True).start()
 
 
 def handle_image(event) -> None:
-    """
-    照片訊息流程：
-      download → save_to_temp → build event → backup → enqueue → reply → trigger_worker
-    """
-    user_id    = event.source.user_id
-    message_id = event.message.id
-    _log.info("image from %s (msg: %s)", user_id, message_id)
-
-    # 在 request thread 下載，存 temp（不呼叫 Drive API，保持快速）
     ts       = make_timestamp()
-    filename = drive_service.make_filename(ts, message_id, "jpg")
-    raw      = drive_service.download_line_content(message_id)
-    drive_service.save_to_temp(raw, filename)
+    user_id  = event.source.user_id
+    msg_id   = event.message.id
+    event_id = f"{ts}_{user_id[-6:]}"
 
-    ev = LifeEvent.from_image(user_id=user_id, timestamp=ts)
-    backup_service.write_backup(ev)    # 失敗 → deadletter，繼續
-    queue_service.enqueue(ev)
+    if sheets_service.is_duplicate_and_mark(event_id):
+        _log.info("dedup skip image: %s", event_id)
+        return
 
-    _reply(event.reply_token, "📷 已排程上傳")
-    async_worker.trigger_worker()
+    ev = LifeEvent.from_image(user_id, ts)
+
+    try:
+        _reply(event.reply_token, "📷 已記錄")
+    except Exception as e:
+        _log.error("reply failed: %s", e)
+
+    threading.Thread(target=_process_image, args=(ev, msg_id), daemon=True).start()
+
+
+# ── Background worker（串行）────────────────────────────────
+
+def _process_text(ev: LifeEvent) -> None:
+    with _worker_lock:
+        ev.status = "ok"
+        sheets_service.append_event(ev)
+
+
+def _process_image(ev: LifeEvent, message_id: str) -> None:
+    with _worker_lock:
+        raw            = drive_service.download_line_content(message_id)
+        filename       = drive_service.make_filename(ev.timestamp, message_id, "jpg")
+        ev.drive_url, ev.status = drive_service.compress_and_upload(raw, filename)
+        sheets_service.append_event(ev)
+
+
+# ── 工具 ─────────────────────────────────────────────────────
+
+def _reply(reply_token: str, text: str) -> None:
+    with ApiClient(_config) as api_client:
+        MessagingApi(api_client).reply_message(
+            ReplyMessageRequest(
+                reply_token = reply_token,
+                messages    = [TextMessage(text=text)],
+            )
+        )
