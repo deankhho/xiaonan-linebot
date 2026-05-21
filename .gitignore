@@ -1,0 +1,16 @@
+# 機密
+.env
+service_account.json
+
+# Runtime 目錄（資料在本機，不進 repo）
+backup/
+deadletter/
+queue/
+temp/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
