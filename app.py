@@ -1,6 +1,6 @@
-# app.py — 主程式入口（Cloud-native 版）
-# LINE Bot Webhook + /healthz
-# Phase 1：text + image（video 不支援）
+# app.py — 主程式入口（整合版）
+# LINE Bot Webhook + /healthz（含子系統狀態）
+# 支援：text（Gemini + #指令）| image | video
 
 import logging
 import os
@@ -8,10 +8,15 @@ import os
 from flask import Flask, request, abort, jsonify
 from linebot.v3.webhook import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent
+from linebot.v3.webhooks import (
+    MessageEvent,
+    TextMessageContent,
+    ImageMessageContent,
+    VideoMessageContent,
+)
 
-from handlers.message_handler import handle_text, handle_image
-from services import sheets_service
+from handlers.message_handler import handle_text, handle_image, handle_video
+from services import sheets_service, drive_service, gemini_service
 
 # ── Logging（所有模組共用）──────────────────────────────────────
 logging.basicConfig(
@@ -47,10 +52,33 @@ def on_image(event):
     handle_image(event)
 
 
-# ── 健康檢查 ─────────────────────────────────────────────────────
+@handler.add(MessageEvent, message=VideoMessageContent)
+def on_video(event):
+    handle_video(event)
+
+
+# ── 健康檢查（含子系統狀態）──────────────────────────────────────
 @app.route("/healthz")
 def healthz():
-    return jsonify({"status": "ok"})
+    """
+    回傳各子系統狀態：
+    {
+      "status": "ok" | "degraded",
+      "sheets": "ok" | "error",
+      "drive":  "ok" | "error",
+      "gemini": "ok" | "error"
+    }
+    """
+    result = {
+        "status": "ok",
+        "sheets": "ok" if sheets_service.health_check() else "error",
+        "drive":  "ok" if drive_service.health_check()  else "error",
+        "gemini": "ok" if gemini_service.health_check()  else "error",
+    }
+    if any(v == "error" for v in result.values()):
+        result["status"] = "degraded"
+
+    return jsonify(result)
 
 
 # ── 啟動時預熱 dedup cache ────────────────────────────────────────
