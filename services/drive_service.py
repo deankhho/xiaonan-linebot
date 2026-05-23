@@ -1,12 +1,15 @@
 # services/drive_service.py — Google Drive 上傳（Cloud-native 版）
 #
 # 圖片：Pillow 壓縮 → bytes 上傳（圖片通常 < 5MB，安全）
-# 影片：方案 A 串流上傳
-#       requests.get(stream=True) → iter_content → MediaIoBaseUpload(resumable=True)
-#       峰值記憶體 ≈ chunk_size（5MB），不全部載入 RAM
+# 影片：串流寫入 /tmp → 從磁碟上傳（可 seek，支援 resumable retry）→ 刪除暫存
+#       峰值記憶體 ≈ chunk_size（5MB）
+#
+# 注意：原方案 A（_LineStreamIO）因 MediaIoBaseUpload(resumable=True) 需要 seek()
+#       改為方案 B 混合：串流下載到 /tmp（不爆 RAM）+ 從磁碟上傳（可 seek）
 
 import io
 import os
+import tempfile
 import logging
 import requests
 from PIL import Image
@@ -20,7 +23,7 @@ _LINE_API      = "https://api-data.line.me/v2/bot/message"
 _LINE_TOKEN    = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 _IMAGE_MAX_PX  = 1920
 _IMAGE_QUALITY = 85
-_VIDEO_CHUNK   = 5 * 1024 * 1024   # 5MB：Google Drive resumable 建議值
+_VIDEO_CHUNK   = 5 * 1024 * 1024   # 5MB chunk
 _log = logging.getLogger(__name__)
 
 
@@ -29,7 +32,7 @@ def make_filename(timestamp: str, message_id: str, ext: str) -> str:
     return f"{timestamp}_{message_id[:8]}.{ext}"
 
 
-# ── 圖片（原有流程保留）──────────────────────────────────────
+# ── 圖片 ─────────────────────────────────────────────────────
 
 def download_line_content(message_id: str) -> bytes:
     """圖片：全部載入 bytes（圖片 < 5MB，安全）"""
@@ -55,88 +58,60 @@ def compress_and_upload(raw: bytes, filename: str) -> tuple[str, str]:
         return "", "drive_failed"
 
 
-# ── 影片（方案 A 串流上傳）──────────────────────────────────
-
-class _LineStreamIO(io.RawIOBase):
-    """
-    將 requests streaming response（iter_content）包裝為 RawIOBase，
-    供 BufferedReader → MediaIoBaseUpload 讀取。
-    記憶體峰值 ≈ chunk_size（5MB），不全部載入 RAM。
-    """
-
-    def __init__(self, response: requests.Response, chunk_size: int = _VIDEO_CHUNK):
-        self._iter = response.iter_content(chunk_size=chunk_size)
-        self._buf  = b""
-        self._done = False
-
-    def readable(self) -> bool:
-        return True
-
-    def readinto(self, b: bytearray) -> int:
-        if self._done:
-            return 0
-
-        # 補充 buffer（可能一次 next() 拿到的 chunk 比 b 小）
-        while not self._buf:
-            try:
-                self._buf = next(self._iter)
-            except StopIteration:
-                self._done = True
-                return 0
-
-        n        = len(b)
-        chunk    = self._buf[:n]
-        self._buf = self._buf[n:]
-        b[:len(chunk)] = chunk
-        return len(chunk)
-
+# ── 影片（串流 /tmp + resumable 上傳）───────────────────────
 
 def stream_and_upload_video(message_id: str, filename: str) -> tuple[str, str]:
     """
-    影片：方案 A 串流上傳。
-    1. requests.get(stream=True) — 不全部載入記憶體
-    2. _LineStreamIO → BufferedReader — 分塊讀取
-    3. MediaIoBaseUpload(resumable=True) — 分 5MB 上傳到 Drive
+    影片上傳流程：
+    1. requests.get(stream=True) + iter_content → 串流寫入 /tmp（峰值記憶體 ~5MB）
+    2. 從 /tmp 磁碟檔開啟上傳（seekable，支援 resumable retry）
+    3. 上傳完成後刪除暫存檔
     回傳 (drive_url, status)
     """
+    tmp_path = None
     try:
+        # ── 步驟 1：串流下載到 /tmp ──────────────────────────
         url  = f"{_LINE_API}/{message_id}/content"
         resp = requests.get(
             url,
             headers = {"Authorization": f"Bearer {_LINE_TOKEN}"},
             stream  = True,
-            timeout = 120,    # 影片下載允許較長 timeout
+            timeout = 120,
         )
         resp.raise_for_status()
 
-        # 串流 IO 包裝
-        stream_io = io.BufferedReader(_LineStreamIO(resp), buffer_size=_VIDEO_CHUNK)
-        media     = MediaIoBaseUpload(
-            stream_io,
-            mimetype  = "video/mp4",
-            chunksize = _VIDEO_CHUNK,
-            resumable = True,
-        )
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp_path = tmp.name
+            for chunk in resp.iter_content(chunk_size=_VIDEO_CHUNK):
+                if chunk:
+                    tmp.write(chunk)
+        _log.info("video downloaded to tmp: %s (%s)", tmp_path, filename)
 
-        service = _get_service()
-        request = service.files().create(
-            body       = {"name": filename, "parents": [_FOLDER_ID]},
-            media_body = media,
-            fields     = "id",
-        )
+        # ── 步驟 2：從磁碟上傳（可 seek，支援 resumable）───────
+        with open(tmp_path, "rb") as f:
+            media   = MediaIoBaseUpload(
+                f,
+                mimetype  = "video/mp4",
+                chunksize = _VIDEO_CHUNK,
+                resumable = True,
+            )
+            service = _get_service()
+            request = service.files().create(
+                body       = {"name": filename, "parents": [_FOLDER_ID]},
+                media_body = media,
+                fields     = "id",
+            )
 
-        # 逐 chunk 上傳
-        file_id  = None
-        response = None
-        while response is None:
-            status, response = request.next_chunk()
-            if status:
-                _log.info(
-                    "video upload progress: %.0f%% (%s)",
-                    status.progress() * 100,
-                    filename,
-                )
-        file_id = response["id"]
+            response = None
+            while response is None:
+                status, response = request.next_chunk()
+                if status:
+                    _log.info(
+                        "video upload progress: %.0f%% (%s)",
+                        status.progress() * 100,
+                        filename,
+                    )
+            file_id = response["id"]
 
         # 設定公開可讀
         service.permissions().create(
@@ -152,6 +127,17 @@ def stream_and_upload_video(message_id: str, filename: str) -> tuple[str, str]:
         _log.error("video upload failed for %s: %s", filename, e)
         return "", "drive_failed"
 
+    finally:
+        # ── 步驟 3：一定刪除暫存檔 ───────────────────────────
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+                _log.info("tmp file deleted: %s", tmp_path)
+            except Exception as e:
+                _log.warning("tmp delete failed: %s", e)
+
+
+# ── 健康檢查 ─────────────────────────────────────────────────
 
 def health_check() -> bool:
     """確認 Drive 可連線（供 /healthz 使用）"""

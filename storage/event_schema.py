@@ -2,6 +2,8 @@
 #
 # TextEvent  → 對話記錄（文字 + AI 回應）
 # MediaEvent → 媒體記錄（圖片 / 影片）
+#
+# event_id 一律由呼叫方傳入（使用 event.message.id，LINE 保證全域唯一）
 
 from __future__ import annotations
 from dataclasses import dataclass, asdict
@@ -18,11 +20,6 @@ def make_timestamp() -> str:
     return datetime.now(_TZ).strftime("%Y%m%d_%H%M%S")
 
 
-def make_event_id(timestamp: str, user_id: str) -> str:
-    """idempotency key：timestamp + user_id 末 6 碼"""
-    return f"{timestamp}_{user_id[-6:]}"
-
-
 # ── 文字事件 ─────────────────────────────────────────────────
 
 @dataclass
@@ -30,6 +27,7 @@ class TextEvent:
     """
     文字對話事件。
     欄位：event_id / timestamp / sender / content / ai_response / status
+    event_id = event.message.id（LINE 全域唯一，用於 dedup）
     """
 
     event_id:    str
@@ -44,9 +42,9 @@ class TextEvent:
     ]
 
     @classmethod
-    def from_user(cls, user_id: str, content: str, timestamp: str) -> "TextEvent":
+    def from_user(cls, event_id: str, user_id: str, content: str, timestamp: str) -> "TextEvent":
         return cls(
-            event_id  = make_event_id(timestamp, user_id),
+            event_id  = event_id,
             timestamp = timestamp,
             sender    = user_id,
             content   = content,
@@ -74,6 +72,7 @@ class MediaEvent:
     """
     媒體事件（圖片 / 影片）。
     欄位：event_id / timestamp / sender / media_type / drive_url / status
+    event_id = event.message.id（LINE 全域唯一，用於 dedup）
     """
 
     event_id:   str
@@ -88,9 +87,9 @@ class MediaEvent:
     ]
 
     @classmethod
-    def from_line(cls, user_id: str, media_type: str, timestamp: str) -> "MediaEvent":
+    def from_line(cls, event_id: str, user_id: str, media_type: str, timestamp: str) -> "MediaEvent":
         return cls(
-            event_id   = make_event_id(timestamp, user_id),
+            event_id   = event_id,
             timestamp  = timestamp,
             sender     = user_id,
             media_type = media_type,
