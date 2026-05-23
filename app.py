@@ -60,7 +60,7 @@ def on_video(event):
 
 # ── 健康檢查（含 5 分鐘 TTL cache，避免打爆 API quota）────────────
 _healthz_cache: dict = {}
-_HEALTHZ_TTL = 300   # 5 分鐘
+_HEALTHZ_TTL = 60    # 60 秒（Drive/Sheets 異常最多 1 分鐘才知道）
 
 
 @app.route("/healthz")
