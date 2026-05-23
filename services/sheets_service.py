@@ -190,9 +190,6 @@ def health_check() -> bool:
 
 def _get_service():
     raw = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-    _log.info("GOOGLE_CREDENTIALS_JSON len=%s first=%r",
-              len(raw) if raw is not None else "None",
-              raw[:1] if raw else "")
     if not raw:
         raise RuntimeError("GOOGLE_CREDENTIALS_JSON missing")
     creds_info = json.loads(raw)
