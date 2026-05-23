@@ -10,6 +10,7 @@
 #   - Sheets 失敗 → logging.error 固定格式（SHEETS_FAIL），Render logs 可救回
 
 import os
+import json
 import threading
 import logging
 from collections import deque
@@ -188,8 +189,12 @@ def health_check() -> bool:
 # ── 內部 ─────────────────────────────────────────────────────
 
 def _get_service():
-    creds = service_account.Credentials.from_service_account_file(
-        os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json"),
+    raw = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if not raw:
+        raise RuntimeError("GOOGLE_CREDENTIALS_JSON missing")
+    creds_info = json.loads(raw)
+    creds = service_account.Credentials.from_service_account_info(
+        creds_info,
         scopes=_SCOPES,
     )
     return build("sheets", "v4", credentials=creds, cache_discovery=False)

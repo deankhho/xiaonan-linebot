@@ -9,6 +9,7 @@
 
 import io
 import os
+import json
 import tempfile
 import logging
 import requests
@@ -175,8 +176,12 @@ def _upload_bytes(data: bytes, filename: str, mimetype: str) -> str:
 
 
 def _get_service():
-    creds = service_account.Credentials.from_service_account_file(
-        os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json"),
+    raw = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if not raw:
+        raise RuntimeError("GOOGLE_CREDENTIALS_JSON missing")
+    creds_info = json.loads(raw)
+    creds = service_account.Credentials.from_service_account_info(
+        creds_info,
         scopes=_SCOPES,
     )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
