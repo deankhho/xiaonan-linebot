@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from linebot.v3.messaging import (
     ApiClient, Configuration, MessagingApi,
     ReplyMessageRequest, TextMessage,
+    QuickReply, QuickReplyItem, MessageAction,
 )
 from linebot.v3.webhooks import GroupSource, RoomSource
 
@@ -36,15 +37,12 @@ _BOT_MENTION = os.environ.get("BOT_MENTION_NAME", "@小暖")  # 群組 @提及�
 _executor = ThreadPoolExecutor(max_workers=4)
 
 # ── 分類系統 ──────────────────────────────────────────────────
-_VALID_CATEGORIES: dict[str, str] = {
-    "#醫療": "醫療",
-    "#旅遊": "旅遊",
-    "#學校": "學校",
-    "#生活": "生活",
-    "#其他": "其他",
-}
-# 待套用分類：{sender_id: category}，用完即棄，Render 重啟後清空（可接受）
-_pending_category: dict[str, str] = {}
+_CATEGORIES = ["醫療", "旅遊", "生活", "知識", "財經", "其他"]
+_CAT_PREFIX = "__cat_"   # Quick Reply 隱藏前綴，避免與一般文字衝突
+
+# 等待分類選擇的暫存：{sender_id: {"msg_id", "media_type", "orig_name", "timestamp", "ev"}}
+# Render 重啟後清空（可接受）
+_pending_upload: dict[str, dict] = {}
 
 
 # ── 群組輔助函式 ──────────────────────────────────────────────
@@ -92,11 +90,20 @@ def handle_text(event) -> None:
         if is_mention and not is_command:
             text = text.replace(_BOT_MENTION, "").strip()  # 去掉 @小暖 後再處理
 
-    # ── 分類標記指令（#醫療 / #旅遊 / #學校 / #生活 / #其他）──
-    if text in _VALID_CATEGORIES:
-        category = _VALID_CATEGORIES[text]
-        _pending_category[user_id] = category
-        _reply(event.reply_token, f"✅ 下一個上傳的檔案將標記為「{category}」")
+    # ── Quick Reply 分類選擇回應 ─────────────────────────────
+    if text.startswith(_CAT_PREFIX):
+        category = text[len(_CAT_PREFIX):]
+        if category in _CATEGORIES and user_id in _pending_upload:
+            pending = _pending_upload.pop(user_id)
+            ev      = pending["ev"]
+            ev.category = category
+            if ev.media_type == "image":
+                _executor.submit(_process_image, ev, pending["msg_id"])
+            elif ev.media_type == "video":
+                _executor.submit(_process_video, ev, pending["msg_id"])
+            elif ev.media_type == "pdf":
+                _executor.submit(_process_file, ev, pending["msg_id"], pending["orig_name"], pending["timestamp"])
+            _reply(event.reply_token, f"✅ 已儲存到【{category}】")
         return  # 不寫 Sheets
 
     # ── 特殊指令 ────────────────────────────────────────────
@@ -104,9 +111,9 @@ def handle_text(event) -> None:
         reply = (
             "【小暖使用說明】\n\n"
             "✉️ 直接傳文字 → 我會回覆並記錄\n"
-            "📷 傳照片 → 壓縮後存入雲端硬碟\n"
-            "🎬 傳影片 → 串流存入雲端硬碟\n"
+            "📷 傳照片/影片/PDF → 點選分類後存入雲端\n"
             "#查詢 → 最近 10 筆對話紀錄\n"
+            "#月報 → 當月統計\n"
             "#幫助 → 這份說明"
         )
         _reply(event.reply_token, reply)
@@ -136,7 +143,7 @@ def handle_text(event) -> None:
             f"🏷️ 分類：\n"
             + "\n".join(
                 f"  {cat} {by_cat.get(cat, 0)}"
-                for cat in ["醫療", "旅遊", "學校", "生活", "其他"]
+                for cat in _CATEGORIES
             )
         )
         _reply(event.reply_token, reply)
@@ -174,23 +181,20 @@ def handle_text(event) -> None:
 
 
 def handle_image(event) -> None:
-    ts       = make_timestamp()
-    user_id  = _get_sender_id(event)
-    msg_id   = event.message.id
+    ts      = make_timestamp()
+    user_id = _get_sender_id(event)
+    msg_id  = event.message.id
 
     if sheets_service.is_duplicate_and_mark(msg_id):
         _log.info("dedup skip image: %s", msg_id)
         return
 
-    category    = _pending_category.pop(user_id, "其他")
-    ev          = MediaEvent.from_line(msg_id, user_id, "image", ts)
-    ev.category = category
-    _reply(event.reply_token, "📷 收到照片，正在儲存…")
-    _executor.submit(_process_image, ev, msg_id)
+    ev = MediaEvent.from_line(msg_id, user_id, "image", ts)
+    _pending_upload[user_id] = {"msg_id": msg_id, "media_type": "image", "orig_name": "", "timestamp": ts, "ev": ev}
+    _reply_with_category_prompt(event.reply_token, "📷", "照片")
 
 
 def handle_file(event) -> None:
-    """PDF 等檔案：下載 → Drive 上傳 → 寫 Sheets"""
     ts        = make_timestamp()
     user_id   = _get_sender_id(event)
     msg_id    = event.message.id
@@ -200,27 +204,23 @@ def handle_file(event) -> None:
         _log.info("dedup skip file: %s", msg_id)
         return
 
-    category    = _pending_category.pop(user_id, "其他")
-    ev          = MediaEvent.from_line(msg_id, user_id, "pdf", ts)
-    ev.category = category
-    _reply(event.reply_token, "📄 收到 PDF，正在儲存…")
-    _executor.submit(_process_file, ev, msg_id, orig_name, ts)
+    ev = MediaEvent.from_line(msg_id, user_id, "pdf", ts)
+    _pending_upload[user_id] = {"msg_id": msg_id, "media_type": "pdf", "orig_name": orig_name, "timestamp": ts, "ev": ev}
+    _reply_with_category_prompt(event.reply_token, "📄", "PDF")
 
 
 def handle_video(event) -> None:
-    ts       = make_timestamp()
-    user_id  = _get_sender_id(event)
-    msg_id   = event.message.id
+    ts      = make_timestamp()
+    user_id = _get_sender_id(event)
+    msg_id  = event.message.id
 
     if sheets_service.is_duplicate_and_mark(msg_id):
         _log.info("dedup skip video: %s", msg_id)
         return
 
-    category    = _pending_category.pop(user_id, "其他")
-    ev          = MediaEvent.from_line(msg_id, user_id, "video", ts)
-    ev.category = category
-    _reply(event.reply_token, "🎬 收到影片，串流儲存中（稍後完成）…")
-    _executor.submit(_process_video, ev, msg_id)
+    ev = MediaEvent.from_line(msg_id, user_id, "video", ts)
+    _pending_upload[user_id] = {"msg_id": msg_id, "media_type": "video", "orig_name": "", "timestamp": ts, "ev": ev}
+    _reply_with_category_prompt(event.reply_token, "🎬", "影片")
 
 
 # ── Background workers（ThreadPoolExecutor，互不阻塞）────────
@@ -268,6 +268,28 @@ def _process_video(ev: MediaEvent, message_id: str) -> None:
 
 
 # ── 工具 ─────────────────────────────────────────────────────
+
+def _reply_with_category_prompt(reply_token: str, emoji: str, label: str) -> None:
+    """傳帶有分類 Quick Reply 按鈕的提示訊息"""
+    items = [
+        QuickReplyItem(action=MessageAction(label=cat, text=f"{_CAT_PREFIX}{cat}"))
+        for cat in _CATEGORIES
+    ]
+    items.append(QuickReplyItem(action=MessageAction(label="略過", text=f"{_CAT_PREFIX}其他")))
+    try:
+        with ApiClient(_config) as api_client:
+            MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(
+                    reply_token = reply_token,
+                    messages    = [TextMessage(
+                        text        = f"{emoji} 收到{label}！請選擇分類：",
+                        quick_reply = QuickReply(items=items),
+                    )],
+                )
+            )
+    except Exception as e:
+        _log.error("reply_with_category_prompt failed: %s", e)
+
 
 def _reply(reply_token: str, text: str) -> None:
     try:
