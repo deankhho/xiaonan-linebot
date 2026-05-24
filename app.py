@@ -14,9 +14,10 @@ from linebot.v3.webhooks import (
     TextMessageContent,
     ImageMessageContent,
     VideoMessageContent,
+    FileMessageContent,
 )
 
-from handlers.message_handler import handle_text, handle_image, handle_video
+from handlers.message_handler import handle_text, handle_image, handle_video, handle_file
 from services import sheets_service, drive_service, gemini_service
 
 # ── Logging（所有模組共用）──────────────────────────────────────
@@ -56,6 +57,11 @@ def on_image(event):
 @handler.add(MessageEvent, message=VideoMessageContent)
 def on_video(event):
     handle_video(event)
+
+
+@handler.add(MessageEvent, message=FileMessageContent)
+def on_file(event):
+    handle_file(event)
 
 
 # ── 健康檢查（含 5 分鐘 TTL cache，避免打爆 API quota）────────────

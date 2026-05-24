@@ -137,6 +137,25 @@ def stream_and_upload_video(message_id: str, filename: str) -> tuple[str, str]:
                 _log.warning("tmp delete failed: %s", e)
 
 
+# ── PDF ──────────────────────────────────────────────────────
+
+def upload_pdf(message_id: str, original_name: str, timestamp: str) -> tuple[str, str]:
+    """
+    PDF：下載 bytes → Drive 上傳 → 回傳 (drive_url, status)
+    檔名格式：20260524_143022_a1b2c3d4_原始名稱.pdf
+    """
+    try:
+        raw      = download_line_content(message_id)
+        base     = os.path.splitext(original_name)[0]   # 去掉副檔名
+        filename = f"{timestamp}_{message_id[:8]}_{base}.pdf"
+        url      = _upload_bytes(raw, filename, "application/pdf")
+        _log.info("pdf upload ok: %s", filename)
+        return url, "ok"
+    except Exception as e:
+        _log.error("pdf upload failed for %s: %s", original_name, e)
+        return "", "drive_failed"
+
+
 # ── 健康檢查 ─────────────────────────────────────────────────
 
 def health_check() -> bool:

@@ -143,6 +143,22 @@ def handle_image(event) -> None:
     _executor.submit(_process_image, ev, msg_id)
 
 
+def handle_file(event) -> None:
+    """PDF 等檔案：下載 → Drive 上傳 → 寫 Sheets"""
+    ts        = make_timestamp()
+    user_id   = _get_sender_id(event)
+    msg_id    = event.message.id
+    orig_name = getattr(event.message, "file_name", "file.pdf")  # 原始檔名
+
+    if sheets_service.is_duplicate_and_mark(msg_id):
+        _log.info("dedup skip file: %s", msg_id)
+        return
+
+    ev = MediaEvent.from_line(msg_id, user_id, "pdf", ts)
+    _reply(event.reply_token, "📄 收到 PDF，正在儲存…")
+    _executor.submit(_process_file, ev, msg_id, orig_name, ts)
+
+
 def handle_video(event) -> None:
     ts       = make_timestamp()
     user_id  = _get_sender_id(event)
@@ -176,6 +192,15 @@ def _process_image(ev: MediaEvent, message_id: str) -> None:
         sheets_service.append_media_event(ev)
     except Exception as e:
         _log.error("_process_image failed: %s", e)
+
+
+def _process_file(ev: MediaEvent, message_id: str, orig_name: str, timestamp: str) -> None:
+    """PDF：下載 → Drive 上傳 → 寫 Sheets"""
+    try:
+        ev.drive_url, ev.status = drive_service.upload_pdf(message_id, orig_name, timestamp)
+        sheets_service.append_media_event(ev)
+    except Exception as e:
+        _log.error("_process_file failed: %s", e)
 
 
 def _process_video(ev: MediaEvent, message_id: str) -> None:
