@@ -10,6 +10,10 @@
 #   text  → 特殊指令（#幫助 / #查詢）或 Gemini 一般助理
 #   image → Pillow 壓縮 → Drive 上傳
 #   video → 串流下載到 /tmp → Drive 上傳（可 seek，支援 resumable）
+#
+# 群組支援：
+#   - 只回應 #指令 或 @小暖（env: BOT_MENTION_NAME）
+#   - user_id 為 None 時（使用者隱私設定）以 group:xxx 代替
 
 import os
 import logging
@@ -18,29 +22,58 @@ from linebot.v3.messaging import (
     ApiClient, Configuration, MessagingApi,
     ReplyMessageRequest, TextMessage,
 )
+from linebot.v3.webhooks import GroupSource, RoomSource
 
 from storage.event_schema import TextEvent, MediaEvent, make_timestamp
 from services import sheets_service, drive_service, gemini_service
 
-_log      = logging.getLogger(__name__)
-_config   = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
+_log         = logging.getLogger(__name__)
+_config      = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
+_BOT_MENTION = os.environ.get("BOT_MENTION_NAME", "@小暖")  # 群組 @提及關鍵字
 
 # ThreadPoolExecutor：允許最多 4 個 background 工作並發
 # 圖片/影片/文字 Sheets 寫入彼此不阻塞
 _executor = ThreadPoolExecutor(max_workers=4)
 
 
+# ── 群組輔助函式 ──────────────────────────────────────────────
+
+def _get_sender_id(event) -> str:
+    """取得發送者 ID；群組中 user_id 可能為 None，改用 group:xxx"""
+    uid = getattr(event.source, "user_id", None)
+    if uid:
+        return uid
+    gid = getattr(event.source, "group_id", None)
+    if gid:
+        return f"group:{gid}"
+    return "unknown"
+
+
+def _is_group(event) -> bool:
+    """判斷是否為群組或多人聊天室訊息"""
+    return isinstance(event.source, (GroupSource, RoomSource))
+
+
 # ── 主要 handler ─────────────────────────────────────────────
 
 def handle_text(event) -> None:
     ts       = make_timestamp()
-    user_id  = event.source.user_id
+    user_id  = _get_sender_id(event)
     text     = event.message.text.strip()
     event_id = event.message.id          # LINE 全域唯一，無碰撞
 
     if sheets_service.is_duplicate_and_mark(event_id):
         _log.info("dedup skip text: %s", event_id)
         return
+
+    # ── 群組過濾：只處理 #指令 或 @提及 ──────────────────────
+    if _is_group(event):
+        is_command = text.startswith("#")
+        is_mention = _BOT_MENTION in text
+        if not is_command and not is_mention:
+            return  # 群組中其他訊息靜默忽略
+        if is_mention and not is_command:
+            text = text.replace(_BOT_MENTION, "").strip()  # 去掉 @小暖 後再處理
 
     # ── 特殊指令 ────────────────────────────────────────────
     if text == "#幫助":
@@ -92,7 +125,7 @@ def handle_text(event) -> None:
 
 def handle_image(event) -> None:
     ts       = make_timestamp()
-    user_id  = event.source.user_id
+    user_id  = _get_sender_id(event)
     msg_id   = event.message.id         # LINE 全域唯一，同時作 event_id + 下載 key
 
     if sheets_service.is_duplicate_and_mark(msg_id):
@@ -106,7 +139,7 @@ def handle_image(event) -> None:
 
 def handle_video(event) -> None:
     ts       = make_timestamp()
-    user_id  = event.source.user_id
+    user_id  = _get_sender_id(event)
     msg_id   = event.message.id
 
     if sheets_service.is_duplicate_and_mark(msg_id):
