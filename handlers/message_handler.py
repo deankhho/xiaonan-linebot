@@ -71,9 +71,10 @@ def handle_text(event) -> None:
         is_command = text.startswith("#")
         is_mention = _BOT_MENTION in text
         if not is_command and not is_mention:
-            # 靜默記錄，不回覆
+            # 回覆確認 + 記錄
+            _reply(event.reply_token, "✅ 已記錄")
             ev = TextEvent.from_user(event_id, user_id, text, ts)
-            ev.ai_response = ""
+            ev.ai_response = "✅ 已記錄"
             ev.status      = "ok"
             _executor.submit(_save_text, ev)
             return
