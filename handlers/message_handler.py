@@ -35,6 +35,17 @@ _BOT_MENTION = os.environ.get("BOT_MENTION_NAME", "@小暖")  # 群組 @提及�
 # 圖片/影片/文字 Sheets 寫入彼此不阻塞
 _executor = ThreadPoolExecutor(max_workers=4)
 
+# ── 分類系統 ──────────────────────────────────────────────────
+_VALID_CATEGORIES: dict[str, str] = {
+    "#醫療": "醫療",
+    "#旅遊": "旅遊",
+    "#學校": "學校",
+    "#生活": "生活",
+    "#其他": "其他",
+}
+# 待套用分類：{sender_id: category}，用完即棄，Render 重啟後清空（可接受）
+_pending_category: dict[str, str] = {}
+
 
 # ── 群組輔助函式 ──────────────────────────────────────────────
 
@@ -81,6 +92,13 @@ def handle_text(event) -> None:
         if is_mention and not is_command:
             text = text.replace(_BOT_MENTION, "").strip()  # 去掉 @小暖 後再處理
 
+    # ── 分類標記指令（#醫療 / #旅遊 / #學校 / #生活 / #其他）──
+    if text in _VALID_CATEGORIES:
+        category = _VALID_CATEGORIES[text]
+        _pending_category[user_id] = category
+        _reply(event.reply_token, f"✅ 下一個上傳的檔案將標記為「{category}」")
+        return  # 不寫 Sheets
+
     # ── 特殊指令 ────────────────────────────────────────────
     if text == "#幫助":
         reply = (
@@ -97,6 +115,32 @@ def handle_text(event) -> None:
         ev.status      = "ok"
         _executor.submit(_save_text, ev)
         return
+
+    if text == "#月報":
+        from datetime import datetime
+        import pytz
+        now        = datetime.now(pytz.timezone("Asia/Taipei"))
+        year_month = now.strftime("%Y%m")
+        display    = now.strftime("%Y年%-m月")
+        text_count = sheets_service.get_monthly_text_count(year_month)
+        media      = sheets_service.get_monthly_media_summary(year_month)
+        by_type    = media.get("by_type", {})
+        by_cat     = media.get("by_category", {})
+        reply = (
+            f"【{display}月報】\n\n"
+            f"📝 對話：{text_count} 筆\n\n"
+            f"📁 媒體：\n"
+            f"  圖片 {by_type.get('image', 0)} 張\n"
+            f"  影片 {by_type.get('video', 0)} 支\n"
+            f"  PDF  {by_type.get('pdf',   0)} 份\n\n"
+            f"🏷️ 分類：\n"
+            + "\n".join(
+                f"  {cat} {by_cat.get(cat, 0)}"
+                for cat in ["醫療", "旅遊", "學校", "生活", "其他"]
+            )
+        )
+        _reply(event.reply_token, reply)
+        return  # 月報不寫 Sheets
 
     if text == "#查詢":
         history = sheets_service.get_recent_text_history(user_id, 10)
@@ -132,13 +176,15 @@ def handle_text(event) -> None:
 def handle_image(event) -> None:
     ts       = make_timestamp()
     user_id  = _get_sender_id(event)
-    msg_id   = event.message.id         # LINE 全域唯一，同時作 event_id + 下載 key
+    msg_id   = event.message.id
 
     if sheets_service.is_duplicate_and_mark(msg_id):
         _log.info("dedup skip image: %s", msg_id)
         return
 
-    ev = MediaEvent.from_line(msg_id, user_id, "image", ts)
+    category    = _pending_category.pop(user_id, "其他")
+    ev          = MediaEvent.from_line(msg_id, user_id, "image", ts)
+    ev.category = category
     _reply(event.reply_token, "📷 收到照片，正在儲存…")
     _executor.submit(_process_image, ev, msg_id)
 
@@ -148,13 +194,15 @@ def handle_file(event) -> None:
     ts        = make_timestamp()
     user_id   = _get_sender_id(event)
     msg_id    = event.message.id
-    orig_name = getattr(event.message, "file_name", "file.pdf")  # 原始檔名
+    orig_name = getattr(event.message, "file_name", "file.pdf")
 
     if sheets_service.is_duplicate_and_mark(msg_id):
         _log.info("dedup skip file: %s", msg_id)
         return
 
-    ev = MediaEvent.from_line(msg_id, user_id, "pdf", ts)
+    category    = _pending_category.pop(user_id, "其他")
+    ev          = MediaEvent.from_line(msg_id, user_id, "pdf", ts)
+    ev.category = category
     _reply(event.reply_token, "📄 收到 PDF，正在儲存…")
     _executor.submit(_process_file, ev, msg_id, orig_name, ts)
 
@@ -168,7 +216,9 @@ def handle_video(event) -> None:
         _log.info("dedup skip video: %s", msg_id)
         return
 
-    ev = MediaEvent.from_line(msg_id, user_id, "video", ts)
+    category    = _pending_category.pop(user_id, "其他")
+    ev          = MediaEvent.from_line(msg_id, user_id, "video", ts)
+    ev.category = category
     _reply(event.reply_token, "🎬 收到影片，串流儲存中（稍後完成）…")
     _executor.submit(_process_video, ev, msg_id)
 
@@ -184,30 +234,34 @@ def _save_text(ev: TextEvent) -> None:
 
 
 def _process_image(ev: MediaEvent, message_id: str) -> None:
-    """圖片：下載 → Pillow 壓縮 → Drive 上傳 → 寫 Sheets"""
+    """圖片：下載 → Pillow 壓縮 → Drive 上傳（依分類子資料夾）→ 寫 Sheets"""
     try:
-        raw               = drive_service.download_line_content(message_id)
-        filename          = drive_service.make_filename(ev.timestamp, message_id, "jpg")
-        ev.drive_url, ev.status = drive_service.compress_and_upload(raw, filename)
+        raw      = drive_service.download_line_content(message_id)
+        filename = drive_service.make_filename(ev.timestamp, message_id, "jpg")
+        ev.drive_url, ev.status = drive_service.compress_and_upload(raw, filename, ev.category)
         sheets_service.append_media_event(ev)
     except Exception as e:
         _log.error("_process_image failed: %s", e)
 
 
 def _process_file(ev: MediaEvent, message_id: str, orig_name: str, timestamp: str) -> None:
-    """PDF：下載 → Drive 上傳 → 寫 Sheets"""
+    """PDF：下載 → Drive 上傳（依分類子資料夾）→ 寫 Sheets"""
     try:
-        ev.drive_url, ev.status = drive_service.upload_pdf(message_id, orig_name, timestamp)
+        ev.drive_url, ev.status = drive_service.upload_pdf(
+            message_id, orig_name, timestamp, ev.category
+        )
         sheets_service.append_media_event(ev)
     except Exception as e:
         _log.error("_process_file failed: %s", e)
 
 
 def _process_video(ev: MediaEvent, message_id: str) -> None:
-    """影片：串流到 /tmp → Drive resumable 上傳 → 寫 Sheets"""
+    """影片：串流到 /tmp → Drive resumable 上傳（依分類子資料夾）→ 寫 Sheets"""
     try:
-        filename          = drive_service.make_filename(ev.timestamp, message_id, "mp4")
-        ev.drive_url, ev.status = drive_service.stream_and_upload_video(message_id, filename)
+        filename = drive_service.make_filename(ev.timestamp, message_id, "mp4")
+        ev.drive_url, ev.status = drive_service.stream_and_upload_video(
+            message_id, filename, ev.category
+        )
         sheets_service.append_media_event(ev)
     except Exception as e:
         _log.error("_process_video failed: %s", e)

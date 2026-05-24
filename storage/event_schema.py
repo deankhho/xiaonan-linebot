@@ -70,20 +70,21 @@ class TextEvent:
 @dataclass
 class MediaEvent:
     """
-    媒體事件（圖片 / 影片）。
-    欄位：event_id / timestamp / sender / media_type / drive_url / status
+    媒體事件（圖片 / 影片 / PDF）。
+    欄位：event_id / timestamp / sender / media_type / category / drive_url / status
     event_id = event.message.id（LINE 全域唯一，用於 dedup）
     """
 
     event_id:   str
     timestamp:  str
     sender:     str
-    media_type: str            # "image" | "video"
+    media_type: str            # "image" | "video" | "pdf"
+    category:   str = "其他"   # 手動標記分類；未標記預設「其他」
     drive_url:  str = ""       # Drive 分享 URL；失敗填 ""
     status:     str = "pending"
 
     SHEET_HEADERS: ClassVar[list[str]] = [
-        "EventID", "時間", "傳送者", "類型", "Drive連結", "狀態"
+        "EventID", "時間", "傳送者", "類型", "分類", "Drive連結", "狀態"
     ]
 
     @classmethod
@@ -96,12 +97,13 @@ class MediaEvent:
         )
 
     def to_sheet_row(self) -> list[str]:
-        """6 欄，順序與 SHEET_HEADERS 一致"""
+        """7 欄，順序與 SHEET_HEADERS 一致"""
         return [
             self.event_id,
             self.timestamp,
             self.sender,
             self.media_type,
+            self.category,
             self.drive_url,
             self.status,
         ]

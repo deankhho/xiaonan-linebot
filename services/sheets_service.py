@@ -146,6 +146,56 @@ def append_media_event(ev: MediaEvent) -> None:
         )
 
 
+def get_monthly_text_count(year_month: str) -> int:
+    """
+    計算當月對話筆數。year_month = "202605"
+    時間戳格式 YYYYMMDD_HHMMSS，取前 6 碼比對。
+    """
+    try:
+        rows = _get_service().spreadsheets().values().get(
+            spreadsheetId = _SPREADSHEET_ID,
+            range         = f"{_SHEET_TEXT}!B2:B",   # B 欄 = 時間
+        ).execute().get("values", [])
+        return sum(1 for row in rows if row and row[0][:6] == year_month)
+    except Exception as e:
+        _log.error("get_monthly_text_count failed: %s", e)
+        return 0
+
+
+def get_monthly_media_summary(year_month: str) -> dict:
+    """
+    統計當月媒體記錄。year_month = "202605"
+    回傳 {"total": int, "by_type": {...}, "by_category": {...}}
+    欄位順序（新）：A=EventID B=時間 C=傳送者 D=類型 E=分類 F=Drive連結 G=狀態
+    """
+    try:
+        rows = _get_service().spreadsheets().values().get(
+            spreadsheetId = _SPREADSHEET_ID,
+            range         = f"{_SHEET_MEDIA}!A2:G",
+        ).execute().get("values", [])
+    except Exception as e:
+        _log.error("get_monthly_media_summary failed: %s", e)
+        return {}
+
+    by_type:     dict[str, int] = {}
+    by_category: dict[str, int] = {}
+    total = 0
+
+    for row in rows:
+        if len(row) < 2:
+            continue
+        ts = row[1]                                          # B = 時間
+        if len(ts) < 6 or ts[:6] != year_month:
+            continue
+        total += 1
+        mtype    = row[3] if len(row) > 3 else "其他"        # D = 類型
+        category = row[4] if len(row) > 4 else "其他"        # E = 分類
+        by_type[mtype]       = by_type.get(mtype, 0) + 1
+        by_category[category] = by_category.get(category, 0) + 1
+
+    return {"total": total, "by_type": by_type, "by_category": by_category}
+
+
 def init_headers() -> None:
     """
     部署後執行一次，建立兩張工作表的標題列。
