@@ -17,3 +17,7 @@ __pycache__/
 *.pyo
 .venv/
 *.egg-info/
+
+# OAuth credentials (local only)
+client_secrets.json
+get_refresh_token.py
