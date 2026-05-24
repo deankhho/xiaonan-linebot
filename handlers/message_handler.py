@@ -66,12 +66,17 @@ def handle_text(event) -> None:
         _log.info("dedup skip text: %s", event_id)
         return
 
-    # ── 群組過濾：只處理 #指令 或 @提及 ──────────────────────
+    # ── 群組處理：全部記錄，但只有 #指令 或 @提及才回覆 ────
     if _is_group(event):
         is_command = text.startswith("#")
         is_mention = _BOT_MENTION in text
         if not is_command and not is_mention:
-            return  # 群組中其他訊息靜默忽略
+            # 靜默記錄，不回覆
+            ev = TextEvent.from_user(event_id, user_id, text, ts)
+            ev.ai_response = ""
+            ev.status      = "ok"
+            _executor.submit(_save_text, ev)
+            return
         if is_mention and not is_command:
             text = text.replace(_BOT_MENTION, "").strip()  # 去掉 @小暖 後再處理
 
