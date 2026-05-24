@@ -9,12 +9,11 @@
 
 import io
 import os
-import json
 import tempfile
 import logging
 import requests
 from PIL import Image
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
@@ -176,12 +175,13 @@ def _upload_bytes(data: bytes, filename: str, mimetype: str) -> str:
 
 
 def _get_service():
-    raw = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-    if not raw:
-        raise RuntimeError("GOOGLE_CREDENTIALS_JSON missing")
-    creds_info = json.loads(raw)
-    creds = service_account.Credentials.from_service_account_info(
-        creds_info,
-        scopes=_SCOPES,
+    """個人 OAuth2 Token 上傳，使用使用者自己的 Drive 配額"""
+    creds = Credentials(
+        token         = None,
+        refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN"),
+        client_id     = os.environ.get("GOOGLE_CLIENT_ID"),
+        client_secret = os.environ.get("GOOGLE_CLIENT_SECRET"),
+        token_uri     = "https://oauth2.googleapis.com/token",
+        scopes        = _SCOPES,
     )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
