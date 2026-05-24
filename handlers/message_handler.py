@@ -275,7 +275,6 @@ def _reply_with_category_prompt(reply_token: str, emoji: str, label: str) -> Non
         QuickReplyItem(action=MessageAction(label=cat, text=f"{_CAT_PREFIX}{cat}"))
         for cat in _CATEGORIES
     ]
-    items.append(QuickReplyItem(action=MessageAction(label="略過", text=f"{_CAT_PREFIX}其他")))
     try:
         with ApiClient(_config) as api_client:
             MessagingApi(api_client).reply_message(
