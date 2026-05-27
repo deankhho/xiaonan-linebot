@@ -75,22 +75,7 @@ def handle_text(event) -> None:
         _log.info("dedup skip text: %s", event_id)
         return
 
-    # ── 群組處理：全部記錄，但只有 #指令 或 @提及才回覆 ────
-    if _is_group(event):
-        is_command = text.startswith("#")
-        is_mention = _BOT_MENTION in text
-        if not is_command and not is_mention:
-            # 回覆確認 + 記錄
-            _reply(event.reply_token, "✅ 已記錄")
-            ev = TextEvent.from_user(event_id, user_id, text, ts)
-            ev.ai_response = "✅ 已記錄"
-            ev.status      = "ok"
-            _executor.submit(_save_text, ev)
-            return
-        if is_mention and not is_command:
-            text = text.replace(_BOT_MENTION, "").strip()  # 去掉 @小暖 後再處理
-
-    # ── Quick Reply 分類選擇回應 ─────────────────────────────
+    # ── Quick Reply 分類選擇回應（必須在群組過濾前，否則被攔截）─
     if text.startswith(_CAT_PREFIX):
         category = text[len(_CAT_PREFIX):]
         if category in _CATEGORIES and user_id in _pending_upload:
@@ -105,6 +90,21 @@ def handle_text(event) -> None:
                 _executor.submit(_process_file, ev, pending["msg_id"], pending["orig_name"], pending["timestamp"])
             _reply(event.reply_token, f"✅ 已儲存到【{category}】")
         return  # 不寫 Sheets
+
+    # ── 群組處理：全部記錄，但只有 #指令 或 @提及才回覆 ────
+    if _is_group(event):
+        is_command = text.startswith("#")
+        is_mention = _BOT_MENTION in text
+        if not is_command and not is_mention:
+            # 回覆確認 + 記錄
+            _reply(event.reply_token, "✅ 已記錄")
+            ev = TextEvent.from_user(event_id, user_id, text, ts)
+            ev.ai_response = "✅ 已記錄"
+            ev.status      = "ok"
+            _executor.submit(_save_text, ev)
+            return
+        if is_mention and not is_command:
+            text = text.replace(_BOT_MENTION, "").strip()  # 去掉 @小暖 後再處理
 
     # ── 特殊指令 ────────────────────────────────────────────
     if text == "#幫助":
