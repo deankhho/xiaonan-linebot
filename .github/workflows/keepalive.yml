@@ -1,0 +1,45 @@
+# 小暖 Bot 防休眠（第二道保險）
+#
+# 為什麼需要：Render 免費方案閒置一段時間就休眠，冷啟實測 65 秒。
+# LINE 的 reply_token 時效很短，冷啟醒來時多半已過期 → 分類按鈕送不出去
+# → 使用者不會點分類 → 照片永遠不會上傳（上傳是點分類之後才觸發）。
+#
+# 原本靠 cron-job.org 每 5 分鐘 ping，但 2026-09-02 實測已失效且無人察覺。
+# 本 workflow 是第二道獨立保險，兩道都在才不怕單點失效。
+#
+# ⚠️ 已知限制（不要當成萬無一失）：
+#   1. GitHub Actions 的 schedule 常延遲 5~15 分鐘，不保證準時
+#   2. repo 連續 60 天沒有任何 commit，GitHub 會自動停用排程 workflow
+#      → 巡查員機制要把「這個 workflow 最後成功時間」也納入巡檢項目
+name: keepalive
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # 每 10 分鐘（Render 約閒置 15 分鐘才休眠）
+  workflow_dispatch:          # 允許手動觸發，方便驗證
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /healthz 並檢查回應時間
+        run: |
+          URL="https://xiaonan-linebot.onrender.com/healthz"
+          # -w 取得 HTTP 狀態碼與總耗時；--max-time 給足冷啟時間（實測冷啟 65s）
+          OUT=$(curl -s -o /dev/null -w "%{http_code} %{time_total}" --max-time 120 "$URL")
+          CODE=$(echo "$OUT" | cut -d' ' -f1)
+          TIME=$(echo "$OUT" | cut -d' ' -f2)
+          echo "HTTP=$CODE  耗時=${TIME}s"
+
+          if [ "$CODE" != "200" ]; then
+            echo "::error::健康檢查失敗，HTTP=$CODE"
+            exit 1
+          fi
+
+          # 耗時 > 5 秒視為「這次是把它從休眠叫醒的」→ 代表保活沒生效，要警示。
+          # 用 awk 比較浮點數（shell 的 test 不吃小數）。
+          if awk "BEGIN{exit !($TIME > 5)}"; then
+            echo "::warning::回應耗時 ${TIME}s，判定為冷啟——保活可能沒生效，請檢查 cron-job.org 的排程"
+          else
+            echo "服務為喚醒狀態（${TIME}s），保活正常"
+          fi

@@ -20,7 +20,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from linebot.v3.messaging import (
     ApiClient, Configuration, MessagingApi,
-    ReplyMessageRequest, TextMessage,
+    ReplyMessageRequest, PushMessageRequest, TextMessage,
     QuickReply, QuickReplyItem, MessageAction,
 )
 from linebot.v3.webhooks import GroupSource, RoomSource
@@ -89,6 +89,14 @@ def handle_text(event) -> None:
             elif ev.media_type == "pdf":
                 _executor.submit(_process_file, ev, pending["msg_id"], pending["orig_name"], pending["timestamp"])
             _reply(event.reply_token, f"✅ 已儲存到【{category}】")
+        else:
+            # 2026-09-03：暫存查無此人＝Render 在「傳檔」與「點分類」之間重啟過，
+            # _pending_upload（記憶體 dict）被清空。舊版在這裡直接 return，使用者
+            # 端完全沒有訊息，檔案也永遠不會上傳＝靜默遺失。改成明確告知要重傳。
+            _log.warning("pending not found for %s (category=%s)", user_id, category)
+            _reply(event.reply_token,
+                   "⚠️ 找不到剛才那個檔案（伺服器中途重啟了）。\n"
+                   "麻煩再傳一次，這次選分類就會存進去。")
         return  # 不寫 Sheets
 
     # ── 群組處理：全部記錄，但只有 #指令 或 @提及才回覆 ────
@@ -191,7 +199,7 @@ def handle_image(event) -> None:
 
     ev = MediaEvent.from_line(msg_id, user_id, "image", ts)
     _pending_upload[user_id] = {"msg_id": msg_id, "media_type": "image", "orig_name": "", "timestamp": ts, "ev": ev}
-    _reply_with_category_prompt(event.reply_token, "📷", "照片")
+    _reply_with_category_prompt(event.reply_token, "📷", "照片", user_id)
 
 
 def handle_file(event) -> None:
@@ -206,7 +214,7 @@ def handle_file(event) -> None:
 
     ev = MediaEvent.from_line(msg_id, user_id, "pdf", ts)
     _pending_upload[user_id] = {"msg_id": msg_id, "media_type": "pdf", "orig_name": orig_name, "timestamp": ts, "ev": ev}
-    _reply_with_category_prompt(event.reply_token, "📄", "PDF")
+    _reply_with_category_prompt(event.reply_token, "📄", "PDF", user_id)
 
 
 def handle_video(event) -> None:
@@ -220,7 +228,7 @@ def handle_video(event) -> None:
 
     ev = MediaEvent.from_line(msg_id, user_id, "video", ts)
     _pending_upload[user_id] = {"msg_id": msg_id, "media_type": "video", "orig_name": "", "timestamp": ts, "ev": ev}
-    _reply_with_category_prompt(event.reply_token, "🎬", "影片")
+    _reply_with_category_prompt(event.reply_token, "🎬", "影片", user_id)
 
 
 # ── Background workers（ThreadPoolExecutor，互不阻塞）────────
@@ -269,25 +277,45 @@ def _process_video(ev: MediaEvent, message_id: str) -> None:
 
 # ── 工具 ─────────────────────────────────────────────────────
 
-def _reply_with_category_prompt(reply_token: str, emoji: str, label: str) -> None:
-    """傳帶有分類 Quick Reply 按鈕的提示訊息"""
+def _reply_with_category_prompt(reply_token: str, emoji: str, label: str,
+                                user_id: str = "") -> None:
+    """傳帶有分類 Quick Reply 按鈕的提示訊息。
+
+    2026-09-03 加 push 後備：LINE 的 reply_token 時效很短，Render 免費方案
+    休眠後冷啟實測要 65 秒（暖機時只要 0.26 秒），醒來時 token 早已失效 →
+    reply_message 丟例外 → 舊版只寫 log，使用者端完全看不到分類按鈕 →
+    不會去點分類 → 檔案永遠不會上傳（上傳是在點分類之後才觸發的）。
+    改成 reply 失敗就改用 push_message 補送，push 不需要 reply_token。
+    """
     items = [
         QuickReplyItem(action=MessageAction(label=cat, text=f"{_CAT_PREFIX}{cat}"))
         for cat in _CATEGORIES
     ]
+    message = TextMessage(
+        text        = f"{emoji} 收到{label}！請選擇分類：",
+        quick_reply = QuickReply(items=items),
+    )
     try:
         with ApiClient(_config) as api_client:
             MessagingApi(api_client).reply_message(
-                ReplyMessageRequest(
-                    reply_token = reply_token,
-                    messages    = [TextMessage(
-                        text        = f"{emoji} 收到{label}！請選擇分類：",
-                        quick_reply = QuickReply(items=items),
-                    )],
-                )
+                ReplyMessageRequest(reply_token=reply_token, messages=[message])
             )
+        return
     except Exception as e:
-        _log.error("reply_with_category_prompt failed: %s", e)
+        _log.warning("reply_with_category_prompt failed (%s), 改用 push 補送", e)
+
+    # 後備：push（計費，但只在 reply 失敗時才走，正常情況不會觸發）
+    if not user_id or user_id.startswith("group:") or user_id == "unknown":
+        _log.error("push 後備無法執行：user_id 不可用（%r）", user_id)
+        return
+    try:
+        with ApiClient(_config) as api_client:
+            MessagingApi(api_client).push_message(
+                PushMessageRequest(to=user_id, messages=[message])
+            )
+        _log.info("push 後備補送成功：%s", user_id)
+    except Exception as e:
+        _log.error("push 後備也失敗：%s", e)
 
 
 def _reply(reply_token: str, text: str) -> None:
